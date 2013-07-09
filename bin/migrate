@@ -1,41 +1,52 @@
 #!/usr/bin/env perl
 use App::Rad;
+use Capture::Tiny qw( capture_stderr );
+use DateTime;
 use DBI;
-use File::Slurp qw/read_file/;
-use List::MoreUtils qw/firstidx/;
-use List::Util qw/min max/;
+use File::Slurp qw( read_file );
+use List::MoreUtils qw( firstidx );
+use List::Util qw( min max );
 
 my $DB_TABLE='migrations';
-my $CREATE_TABLE="CREATE TABLE $DB_TABLE (version INT PRIMARY KEY)";
+my $CREATE_TABLE="
+    CREATE TABLE $DB_TABLE (
+        id SERIAL PRIMARY KEY,
+        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        version VARCHAR(20) NOT NULL
+    )
+";
+
+# TODO: better way to suppress annoying msgs from postgres?
+open STDERR, '>/dev/null';
 
 App::Rad->run;
 
 sub setup {
     my ($c) = @_;
     $c->register_commands({
-            #deploy => 'Deploy a specific version (default to latest)',
             generate => 'Generate a new migration directory',
             install => 'Install migrations table',
             latest => 'Migrate to the latest timestamp',
-            snapshot => 'Write snapshot.sql to current db version',
-            to => 'Migrate to a specific version (up or down)',
+            apply => 'Apply a specific version migration',
+            unapply => 'Un-apply a specific version migration',
     });
 }
 
 sub pre_process {
     my ($c) = @_;
 
+    # Default migrations dir
     $c->stash->{migration_dir} = $c->options->{dir} || 'migrations';
 
     unless (!$c->cmd || $c->cmd ~~ ['generate', 'help']){
-        $c->getopt( 'dsn|d=s', 'user|u=s', 'pass|p=s' )
+        $c->getopt( 'dsn|d=s', 'user|u=s', 'pass|p=s', 'dir|r:s' )
             or $c->execute('usage') and return;
 
         $c->stash->{dbh} = DBI->connect(
             $c->options->{dsn},
             $c->options->{user},
             $c->options->{pass},
-            { RaiseError => 1, AutoCommit => 0, PrintError => 0 },
+            {RaiseError => 1, AutoCommit => 0, PrintError => 0, PrintWarn => 1},
         );
     }
 }
@@ -49,13 +60,12 @@ sub post_process {
 sub generate {
     my ($c) = @_;
     my $root = $c->stash->{migration_dir};
-    my @fs_versions = _fs_versions( $c );
-    my $new_version = max( @fs_versions ) + 1;
 
-    `mkdir -p $root/$new_version`;
-    `touch $root/$new_version/up.sql`;
-    `touch $root/$new_version/down.sql`;
-    return "Created migration $root/$new_version";
+    my $now = DateTime->now->epoch;
+    `mkdir -p $root/$now`;
+    `touch $root/$now/up.sql`;
+    `touch $root/$now/down.sql`;
+    return "Created migration $root/$now";
 }
 
 sub install {
@@ -68,56 +78,93 @@ sub install {
 sub latest {
     my ($c) = @_;
     my @fs_versions = _fs_versions($c);
-    to( $c, max(@fs_versions) );
+    my @db_versions = _db_versions($c);
+
+    # Find versions in fs_versions but *not* in db_versions
+    my %diff;
+    @diff{ @fs_versions } = @fs_versions;
+    delete @diff{ @$db_versions };
+    my @diff = keys %diff;
+
+    apply( $c, \@diff);
 }
 
-sub snapshot {
-    my ($c) = @_;
-    my $sth = $c->stash->{dbh}->table_info('', '%', '');
-    my $schemas = $c->stash->{dbh}->selectcol_arrayref($sth, {Columns => [2]});
-    print "Schemas: ", join ', ', @$schemas;
-    print "Tables: ", join ', ', @$schemas;
-}
-
-sub to {
-    my ($c, $to_version) = @_;
+sub apply {
+    my ($c, $versions) = @_;
     my $root = $c->stash->{migration_dir};
-    my @fs_versions = _fs_versions( $c );
-    my @db_versions = _db_versions( $c );
-    my $current_version = max(@db_versions) || 0;
+    $versions = $versions || $c->argv;
+    my @fs_versions = _fs_versions($c);
+    my @db_versions = _db_versions($c);
 
-    $to_version = $to_version || $c->argv->[0] || max($fs_versions);
+    return "Invalid versions" unless ref $versions eq 'ARRAY';
+    # Sort the versions to apply
+    $versions = [ sort( @$versions ) ];
 
-    return "Invalid version number!" unless $to_version =~ /^\d+$/;
-    return "Version $to_version does not exist!"
-        unless $to_version <= max(@fs_versions);
-
-    if ($current_version > $to_version){
-        # Downgrade
-        for my $v (reverse @db_versions){
-            if ($v > $to_version){
-                print "Migrating down to " . ($v-1) . "...";
-                my $down_sql = read_file("$root/$v/down.sql");
-                $c->stash->{dbh}->do($down_sql);
-                $c->stash->{dbh}->do(
-                    "DELETE FROM $DB_TABLE WHERE version ='$v'");
-                print "done.\n";
-            }
+    # Apply
+    for my $v (@$versions){
+        unless ( $v =~ /^\d+$/ ) {
+            print "Invalid version number: $v, skipping.\n";
+            next;
         }
-    } elsif($current_version < $to_version) {
-        my @vers = grep {$_ > $current_version} @fs_versions;
-        # Upgrade
-        for my $v (@vers){
-            if ($v <= $to_version){
-                print "Migrating up to $v...";
-                my $up_sql = read_file("$root/$v/up.sql");
-                $c->stash->{dbh}->do($up_sql);
-                $c->stash->{dbh}->do(
-                    "INSERT INTO $DB_TABLE (version) VALUES ($d)");
-                print "done.\n";
-            }
+        unless ( -e "$root/$v/up.sql" ) {
+            print "Version $v does not exist, skipping.\n";
+            next;
         }
+        if( (firstidx { $_ == $v } @db_versions) >= 0 ) {
+            print "Version $v is already applied, skipping.\n";
+            next;
+        }
+
+
+        print "Applying $v...";
+        my $up_sql = read_file("$root/$v/up.sql");
+        _query_do( $c, $up_sql );
+        _query_do( $c, "INSERT INTO $DB_TABLE (version) VALUES ('$v')" );
+        print "done.\n";
     }
+
+    $c->stash->{dbh}->commit;
+    return '';
+}
+
+sub unapply {
+    my ($c, $versions) = @_;
+    my $root = $c->stash->{migration_dir};
+    my @fs_versions = _fs_versions($c);
+    my @db_versions = _db_versions($c);
+
+    # Default to argv, then just the most recent
+    $versions = $versions || [ $db_versions[0] ];
+
+    return "Invalid versions" unless ref $versions eq 'ARRAY';
+    # Sort the versions to apply
+    $versions = [ reverse sort( @$versions ) ];
+
+    # Apply
+    for my $v (@$versions){
+        unless ( $v =~ /^\d+$/ ) {
+            print "Invalid version number: $v, skipping.\n";
+            next;
+        }
+        unless ( -e "$root/$v/down.sql" ) {
+            print "Version $v does not exist, skipping.\n";
+            next;
+        }
+        if( (firstidx { $_ == $v } @db_versions) < 0 ) {
+            print "Version $v not applied, skipping.\n";
+            next;
+        }
+        next unless $v;
+
+
+        print "Unapplying $v...";
+        my $down_sql = read_file("$root/$v/down.sql");
+        _query_do( $c, $down_sql );
+        _query_do( $c, "DELETE FROM $DB_TABLE WHERE version ='$v'" );
+
+        print "done.\n";
+    }
+
     $c->stash->{dbh}->commit;
     return '';
 }
@@ -131,6 +178,12 @@ sub _fs_versions {
 sub _db_versions {
     my ($c) = @_;
     my $rows = $c->stash->{dbh}->selectcol_arrayref(
-        "SELECT version FROM $DB_TABLE");
+        "SELECT version FROM $DB_TABLE ORDER BY id DESC");
     return @$rows;
+}
+
+sub _query_do {
+    my ($c, $query) = @_;
+    my $reval = $c->stash->{dbh}->do($query);
+    die "Error running $query" unless $reval;
 }
