@@ -26,3 +26,19 @@ records of the migrations. The table looks as below:
 
 By default, migrations are generated in `migrations` directory. You can also
 pass `--dir` option to specify a directory.
+
+# Testing
+
+To run the tests you must set the following environment variables:
+
+* `PG_HOST` - the postgres host to connect to (defaults to `127.0.0.1`)
+* `PG_USER` - the postgres user to connect with
+* `PG_PWD`  - the password for the postgres user being connected with
+
+The postgres test user must have `CREATEDB` permissions to create temporary
+databases for running tests in.  You can give a user/role this permission
+by running:
+
+```
+ALTER ROLE user_name WITH CREATEDB;
+```
